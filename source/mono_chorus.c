@@ -238,55 +238,71 @@ static void process_frame(Chorus *s, const double input[2], double output[2]) {
    if (s->vector_pos == 0) {
       s->del_start = s->del_offset;
       s->osc_prev_a = q23_floor(s->osc_a);
-      double target = floor(-16.0-992.0*effective(s, DEL)/128.0);
-      s->del_offset += (target-floor(s->del_offset))*s->block_smooth;
-      s->del_step = (s->del_offset-s->del_start)/16.0;
-      s->sm_dep += (effective(s, DEP)-s->sm_dep)*s->block_smooth;
+      double target = floor(-16.0 - 992.0 * effective(s, DEL) / 128.0);
+      s->del_offset += (target - floor(s->del_offset)) * s->block_smooth;
+      s->del_step = (s->del_offset - s->del_start) / 16.0;
+      s->sm_dep += (effective(s, DEP) - s->sm_dep) * s->block_smooth;
       s->depth_start = s->depth_end;
+
       /* The modulation depth is stored at 1/256 sample resolution. */
-      s->depth_end = floor(floor((s->del_offset+16.0)*256.0)*(-s->sm_dep/128.0))/256.0;
-      s->sm_wid += (effective(s, WID)-s->sm_wid)*s->block_smooth;
-      s->sm_wid = floor(s->sm_wid*(Q23/128.0))*(128.0/Q23);
-      const double angle = floor(s->sm_wid*16.0)*(PI_D/4096.0);
+      s->depth_end = floor(floor((s->del_offset + 16.0) * 256.0) *
+                           (-s->sm_dep / 128.0)) / 256.0;
+      s->sm_wid += (effective(s, WID) - s->sm_wid) * s->block_smooth;
+      s->sm_wid = floor(s->sm_wid * (Q23 / 128.0)) * (128.0 / Q23);
+      const double angle = floor(s->sm_wid * 16.0) * (PI_D / 4096.0);
       s->wid_sin_start = s->wid_sin;
       s->wid_cos_start = s->wid_cos;
       s->wid_sin = sin(angle);
       s->wid_cos = cos(angle);
    }
-   const double center = -(s->del_start+s->del_step*(s->vector_pos+1))*s->sample_scale;
-   const double depth = (s->depth_start+(s->depth_end-s->depth_start)*(s->vector_pos/16.0))*s->sample_scale;
+
+   const double center = -(s->del_start + s->del_step * (s->vector_pos + 1)) * s->sample_scale;
+   const double depth = (s->depth_start + (s->depth_end - s->depth_start) *
+                         (s->vector_pos / 16.0)) * s->sample_scale;
    const double speed = effective(s, SPD);
-   const double step = floor(2390.0*speed*speed/16384.0)/Q23 * 44100.0/s->sample_rate;
-   const double m = effective(s, MIX)/128.0;
-   const double q = effective(s, FB)/128.0 + 64881.0/Q23;
-   const double h = (1.0+q)*0.5;
-   const double gain = 4.0*pow(effective(s, INP)/128.0, 2.0);
+   const double step = floor(2390.0 * speed * speed / 16384.0) / Q23 * 44100.0 / s->sample_rate;
+   const double m = effective(s, MIX) / 128.0;
+   const double q = effective(s, FB) / 128.0 + 64881.0 / Q23;
+   const double h = (1.0 + q) * 0.5;
+   const double gain = 4.0 * pow(effective(s, INP) / 128.0, 2.0);
    const double p = effective(s, LP);
    int lpi = (int)p;
    const double alpha = lpi >= 127 ? s->lp_table[127] :
-      s->lp_table[lpi]+(p-lpi)*(s->lp_table[lpi+1]-s->lp_table[lpi]);
-   const double A = q23_floor(s->osc_a), B = q23_floor(s->osc_b);
-   const double t = (double)s->vector_pos/16.0;
-   const double cw = s->wid_cos_start+t*(s->wid_cos-s->wid_cos_start);
-   const double sw = s->wid_sin_start+t*(s->wid_sin-s->wid_sin_start);
-   const double aa[2] = {A, q23_floor(cw*A-sw*B)}, bb[2] = {B, q23_floor(cw*B+sw*A)};
+      s->lp_table[lpi] + (p - lpi) * (s->lp_table[lpi + 1] - s->lp_table[lpi]);
+
+   const double A = q23_floor(s->osc_a);
+   const double B = q23_floor(s->osc_b);
+   const double t = (double)s->vector_pos / 16.0;
+   const double cw = s->wid_cos_start + t * (s->wid_cos - s->wid_cos_start);
+   const double sw = s->wid_sin_start + t * (s->wid_sin - s->wid_sin_start);
+   const double aa[2] = {A, q23_floor(cw * A - sw * B)};
+   const double bb[2] = {B, q23_floor(cw * B + sw * A)};
+
    for (unsigned c = 0; c < 2; ++c) {
-      const double phase[3] = {bb[c], q23_floor(-0.5*bb[c]+0.866025447845459*aa[c]),
-                                      q23_floor(-0.5*bb[c]-0.866025447845459*aa[c])};
+      const double phase[3] = {
+         bb[c],
+         q23_floor(-0.5 * bb[c] + 0.866025447845459 * aa[c]),
+         q23_floor(-0.5 * bb[c] - 0.866025447845459 * aa[c])
+      };
       double wet = 0;
-      for (int i = 0; i < 3; ++i) wet += read_delay(s, c, center-depth*phase[i]);
-      wet = (s->warmup_blocks < 128) ? 0.0:wet/3.0;
-      double x = (isfinite(input[c]) && fabs(input[c]) >= 1e-25) ? clamp(input[c]*gain, -1.0, 1.0-1.0/Q23) : 0.0;
+      for (int i = 0; i < 3; ++i)
+         wet += read_delay(s, c, center - depth * phase[i]);
+      wet = (s->warmup_blocks < 128) ? 0.0 : wet / 3.0;
+
+      double x = (isfinite(input[c]) && fabs(input[c]) >= 1e-25)
+         ? clamp(input[c] * gain, -1.0, 1.0 - 1.0 / Q23) : 0.0;
       const double old = s->lp_state[c];
-      double next = old+alpha*(wet-old);
-      s->lp_state[c] = fabs(next)<1e-25 ? 0.0 : next;
+      double next = old + alpha * (wet - old);
+      s->lp_state[c] = fabs(next) < 1e-25 ? 0.0 : next;
+
       /* Approximate the original 24-bit bounded delay memory. */
-      s->pending[c][s->vector_pos] = clamp(h*x-q*old, -1.0, 1.0);
-      output[c] = clamp((1.0-m)*x+m*wet, -1.0, 1.0-1.0/Q23);
+      s->pending[c][s->vector_pos] = clamp(h * x - q * old, -1.0, 1.0);
+      output[c] = clamp((1.0 - m) * x + m * wet, -1.0, 1.0 - 1.0 / Q23);
    }
-   s->osc_b -= s->osc_prev_a*step;
+
+   s->osc_b -= s->osc_prev_a * step;
    s->osc_prev_a = A;
-   s->osc_a += B*step;
+   s->osc_a += B * step;
    if (s->vector_pos == 15) {
       for (unsigned c = 0; c < 2; c++)
          for (unsigned i = 0; i < 16; i++)
@@ -298,7 +314,7 @@ static void process_frame(Chorus *s, const double input[2], double output[2]) {
    }
    if (++s->write == s->size)
       s->write = 0;
-   s->vector_pos = (s->vector_pos+1)&15u;
+   s->vector_pos = (s->vector_pos + 1) & 15u;
 }
 
 /* Initialise the delay and modulation before the host sends its first note.
