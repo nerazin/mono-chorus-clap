@@ -1,4 +1,5 @@
 #include <clap/clap.h>
+#include "chorus_engine.h"
 #include <math.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -6,17 +7,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(__SSE2__)
-#include <xmmintrin.h>
-#endif
-
-/* A small, independent floating-point reconstruction of the signal flow
- * described in the accompanying reverse-engineering notes. No Elektron ROM
- * or emulator code is included or loaded. */
+/* CLAP wrapper based on 0.3.0. The chorus DSP uses the independently
+ * supplied fixed-point native core, without loading firmware or an emulator. */
 
 #define NPARAM 8
-#define PI_D 3.14159265358979323846264338327950288
-#define Q23 8388608.0
 
 enum { DEL, DEP, SPD, MIX, FB, WID, LP, INP };
 static const char *const names[NPARAM] = {"DEL", "DEP", "SPD", "MIX", "FB", "WID", "LP", "INP"};
@@ -32,7 +26,7 @@ static const clap_plugin_descriptor_t descriptor = {
    .name = "Mono Chorus",
    .vendor = "Independent DSP",
    .url = "", .manual_url = "", .support_url = "",
-   .version = "0.3.0",
+   .version = "0.4.0",
    .description = "Stereo six-tap chorus and metallic resonator",
    .features = features
 };
@@ -42,18 +36,8 @@ typedef struct {
    const clap_host_t *host;
    _Atomic uint64_t base_bits[NPARAM];
    double modulation[NPARAM];
-   double *buffer[2];
-   size_t size, mask, write;
-   double sample_rate, sample_scale, block_smooth;
-   double sm_dep, sm_wid;
-   double del_offset, del_start, del_step;
-   double wid_sin, wid_cos, wid_sin_start, wid_cos_start;
-   double depth_start, depth_end;
-   double osc_a, osc_b, osc_prev_a;
-   double pending[2][16];
-   unsigned warmup_blocks;
-   unsigned vector_pos;
-   double lp_state[2], lp_table[128];
+   void *engine;
+   uint32_t latency;
 } Chorus;
 
 static uint64_t double_bits(double x) {
@@ -79,96 +63,34 @@ static double effective(const Chorus *s, unsigned id) {
    return clamp(base_value(s, id) + s->modulation[id], 0.0, 127.0);
 }
 
-/* Original 7-bit feedback low-pass coefficient curve. */
-static void build_lp_table(Chorus *s) {
-   static const unsigned q[128] = {
-      0x004876, 0x004ce3, 0x005196, 0x005692, 0x005bdc, 0x006179, 0x00676d, 0x006dbe,
-      0x007472, 0x007b8e, 0x008319, 0x008b1a, 0x009398, 0x009c9a, 0x00a629, 0x00b04c,
-      0x00bb0e, 0x00c676, 0x00d291, 0x00df67, 0x00ed06, 0x00fb78, 0x010aca, 0x011b0a,
-      0x012c47, 0x013e8f, 0x0151f2, 0x016682, 0x017c51, 0x019370, 0x01abf5, 0x01c5f5,
-      0x01e187, 0x01fec1, 0x021dbe, 0x023e98, 0x02616b, 0x028654, 0x02ad74, 0x02d6eb,
-      0x0302dd, 0x03316e, 0x0362c5, 0x03970b, 0x03ce6b, 0x040914, 0x044735, 0x048900,
-      0x04ceac, 0x05186e, 0x056684, 0x05b928, 0x06109e, 0x066d27, 0x06cf0c, 0x073696,
-      0x07a413, 0x0817d4, 0x08922e, 0x091378, 0x099c0e, 0x0a2c4e, 0x0ac49d, 0x0b655e,
-      0x0c0efd, 0x0cc1e5, 0x0d7e86, 0x0e4553, 0x0f16c0, 0x0ff345, 0x10db5b, 0x11cf7c,
-      0x12d023, 0x13ddcc, 0x14f8f2, 0x16220c, 0x175993, 0x189ff7, 0x19f5a8, 0x1b5b0b,
-      0x1cd081, 0x1e565e, 0x1fecec, 0x219466, 0x234cf9, 0x2516bd, 0x26f1b5, 0x28ddcf,
-      0x2adadc, 0x2ce891, 0x2f0683, 0x313423, 0x3370bd, 0x35bb79, 0x381350, 0x3a7714,
-      0x3ce56a, 0x3f5ccb, 0x41db85, 0x445fba, 0x46e76a, 0x49706c, 0x4bf87c, 0x4e7d40,
-      0x50fc49, 0x537323, 0x55df5d, 0x583e8d, 0x5a8e63, 0x5cccab, 0x5ef75c, 0x610c9c,
-      0x630acc, 0x64f089, 0x66bcb0, 0x686e62, 0x6a04fd, 0x6b801f, 0x6cdf98, 0x6e236b,
-      0x6f4bba, 0x7058c1, 0x714ac1, 0x7221f3, 0x72de71, 0x73801d, 0x74067d, 0x747093,
-   };
-   for (int v = 0; v < 128; ++v) {
-      double omega = -log1p(-(double)q[v]/Q23);
-      s->lp_table[v] = -expm1(-omega * 44100.0/s->sample_rate);
-   }
-}
-
-static void clear_dsp(Chorus *s) {
-   if (s->buffer[0]) memset(s->buffer[0], 0, s->size*sizeof(double));
-   if (s->buffer[1]) memset(s->buffer[1], 0, s->size*sizeof(double));
-   s->write = 0;
-   s->lp_state[0] = s->lp_state[1] = 0;
-   s->sm_dep = 0.0;
-   s->sm_wid = 0.0;
-   s->del_offset = floor(-992.0*effective(s, DEL)/128.0);
-   s->del_start = s->del_offset;
-   s->del_step = 0;
-   s->vector_pos = 0;
-   s->wid_sin = 0.0;
-   s->wid_cos = 0.0;
-   s->wid_sin_start = 0.0;
-   s->wid_cos_start = 0.0;
-   s->depth_start = s->depth_end = 0.0;
-   s->osc_a = -1.0;
-   s->osc_b = 0.0;
-   s->warmup_blocks = 0;
-   memset(s->pending, 0, sizeof s->pending);
-}
-
 static bool plug_init(const clap_plugin_t *p) {
    (void)p;
    return true;
 }
-static void ready_dsp(Chorus *s);
 static void plug_destroy(const clap_plugin_t *p) {
    Chorus *s = p->plugin_data;
-   free(s->buffer[0]);
-   free(s->buffer[1]);
+   chorus_engine_destroy(s->engine);
    free(s);
 }
 static bool plug_activate(const clap_plugin_t *p, double rate, uint32_t min, uint32_t max) {
    (void)min;
    (void)max;
    Chorus *s = p->plugin_data;
-   if (!isfinite(rate) || rate < 1000 || rate > 768000) return false;
-   size_t count = (size_t)ceil(2048.0 * rate / 44100.0);
-   double *l = calloc(count, sizeof(double)), *r = calloc(count, sizeof(double));
-   if (!l || !r) {
-      free(l);
-      free(r);
-      return false;
+   if (s->engine) return false;
+   s->engine = chorus_engine_create(rate);
+   if (!s->engine) return false;
+   const uint32_t previous = s->latency;
+   s->latency = chorus_engine_latency(s->engine);
+   if (s->latency != previous && s->host && s->host->get_extension) {
+      const clap_host_latency_t *host_latency = s->host->get_extension(s->host, CLAP_EXT_LATENCY);
+      if (host_latency && host_latency->changed) host_latency->changed(s->host);
    }
-   free(s->buffer[0]);
-   free(s->buffer[1]);
-   s->buffer[0] = l;
-   s->buffer[1] = r;
-   s->size = count;
-   s->mask = (count && !(count&(count-1))) ? count-1 : 0;
-   s->sample_rate = rate;
-   s->sample_scale = rate/44100.0;
-   s->block_smooth = -expm1(log1p(-167772.0/Q23)*44100.0/rate);
-   build_lp_table(s);
-   ready_dsp(s);
    return true;
 }
 static void plug_deactivate(const clap_plugin_t *p) {
    Chorus *s = p->plugin_data;
-   free(s->buffer[0]);
-   free(s->buffer[1]);
-   s->buffer[0] = s->buffer[1] = NULL;
-   s->size = 0;
+   chorus_engine_destroy(s->engine);
+   s->engine = NULL;
 }
 static bool plug_start(const clap_plugin_t *p) {
    (void)p;
@@ -178,7 +100,8 @@ static void plug_stop(const clap_plugin_t *p) {
    (void)p;
 }
 static void plug_reset(const clap_plugin_t *p) {
-   ready_dsp(p->plugin_data);
+   Chorus *s = p->plugin_data;
+   chorus_engine_reset(s->engine);
 }
 static void plug_on_main(const clap_plugin_t *p) {
    (void)p;
@@ -199,188 +122,42 @@ static void event(Chorus *s, const clap_event_header_t *h) {
    }
 }
 
-static size_t wrap_index(const Chorus *s, int64_t pos) {
-   if (s->mask)
-      return (size_t)pos & s->mask;
-   int64_t r = pos % (int64_t)s->size;
-   return (size_t)(r < 0 ? r + (int64_t)s->size : r);
-}
-
-static double read_delay(const Chorus *s, unsigned ch, double delay) {
-   /* At unusually low host rates, the scaled minimum delay can be shorter
-    * than one sample. Avoid reading the not-yet-written current sample. */
-   if (delay < 1.0)
-      delay = 1.0;
-   double position = (double)s->write - delay;
-   double below = floor(position), frac = position - below;
-   int64_t pos = (int64_t)below;
-   size_t a = wrap_index(s, pos), b = a + 1 == s->size ? 0 : a + 1;
-   return s->buffer[ch][a] + frac * (s->buffer[ch][b] - s->buffer[ch][a]);
-}
-
-static double q23_floor(double x) {
-   return floor(clamp(x, -1.0, 1.0-1.0/Q23)*Q23)/Q23;
-}
-
-/* Signal flow, separately for left and right:
- *   tap[k] = delay_line(centre - depth * phase[k])   k = 0, 1, 2
- *   wet = (tap[0] + tap[1] + tap[2]) / 3
- *   lowpass += alpha * (wet - lowpass)
- *   write = ((1 + feedback)/2) * input - feedback * previous_lowpass
- *   output = (1 - mix) * input + mix * wet
- * The 120-degree tap phases come from a quadrature oscillator.  Stereo width
- * rotates the right-channel oscillator.  Delay, depth, and width update every
- * 16 frames with ramps within each block.  The small quantisation and clipped
- * phase terms preserve audible behaviour of the original fixed-point design.
- * Feedback reads the previous low-pass value, and writes are committed after
- * all 16 reads so short delays see the same circular-buffer history. */
-static void process_frame(Chorus *s, const double input[2], double output[2]) {
-   if (s->vector_pos == 0) {
-      s->del_start = s->del_offset;
-      s->osc_prev_a = q23_floor(s->osc_a);
-      double target = floor(-16.0 - 992.0 * effective(s, DEL) / 128.0);
-      s->del_offset += (target - floor(s->del_offset)) * s->block_smooth;
-      s->del_step = (s->del_offset - s->del_start) / 16.0;
-      s->sm_dep += (effective(s, DEP) - s->sm_dep) * s->block_smooth;
-      s->depth_start = s->depth_end;
-
-      /* The modulation depth is stored at 1/256 sample resolution. */
-      s->depth_end = floor(floor((s->del_offset + 16.0) * 256.0) *
-                           (-s->sm_dep / 128.0)) / 256.0;
-      s->sm_wid += (effective(s, WID) - s->sm_wid) * s->block_smooth;
-      s->sm_wid = floor(s->sm_wid * (Q23 / 128.0)) * (128.0 / Q23);
-      const double angle = floor(s->sm_wid * 16.0) * (PI_D / 4096.0);
-      s->wid_sin_start = s->wid_sin;
-      s->wid_cos_start = s->wid_cos;
-      s->wid_sin = sin(angle);
-      s->wid_cos = cos(angle);
-   }
-
-   const double center = -(s->del_start + s->del_step * (s->vector_pos + 1)) * s->sample_scale;
-   const double depth = (s->depth_start + (s->depth_end - s->depth_start) *
-                         (s->vector_pos / 16.0)) * s->sample_scale;
-   const double speed = effective(s, SPD);
-   const double step = floor(2390.0 * speed * speed / 16384.0) / Q23 * 44100.0 / s->sample_rate;
-   const double m = effective(s, MIX) / 128.0;
-   const double q = effective(s, FB) / 128.0 + 64881.0 / Q23;
-   const double h = (1.0 + q) * 0.5;
-   const double gain = 4.0 * pow(effective(s, INP) / 128.0, 2.0);
-   const double p = effective(s, LP);
-   int lpi = (int)p;
-   const double alpha = lpi >= 127 ? s->lp_table[127] :
-      s->lp_table[lpi] + (p - lpi) * (s->lp_table[lpi + 1] - s->lp_table[lpi]);
-
-   const double A = q23_floor(s->osc_a);
-   const double B = q23_floor(s->osc_b);
-   const double t = (double)s->vector_pos / 16.0;
-   const double cw = s->wid_cos_start + t * (s->wid_cos - s->wid_cos_start);
-   const double sw = s->wid_sin_start + t * (s->wid_sin - s->wid_sin_start);
-   const double aa[2] = {A, q23_floor(cw * A - sw * B)};
-   const double bb[2] = {B, q23_floor(cw * B + sw * A)};
-
-   for (unsigned c = 0; c < 2; ++c) {
-      const double phase[3] = {
-         bb[c],
-         q23_floor(-0.5 * bb[c] + 0.866025447845459 * aa[c]),
-         q23_floor(-0.5 * bb[c] - 0.866025447845459 * aa[c])
-      };
-      double wet = 0;
-      for (int i = 0; i < 3; ++i)
-         wet += read_delay(s, c, center - depth * phase[i]);
-      wet = (s->warmup_blocks < 128) ? 0.0 : wet / 3.0;
-
-      double x = (isfinite(input[c]) && fabs(input[c]) >= 1e-25)
-         ? clamp(input[c] * gain, -1.0, 1.0 - 1.0 / Q23) : 0.0;
-      const double old = s->lp_state[c];
-      double next = old + alpha * (wet - old);
-      s->lp_state[c] = fabs(next) < 1e-25 ? 0.0 : next;
-
-      /* Approximate the original 24-bit bounded delay memory. */
-      s->pending[c][s->vector_pos] = clamp(h * x - q * old, -1.0, 1.0);
-      output[c] = clamp((1.0 - m) * x + m * wet, -1.0, 1.0 - 1.0 / Q23);
-   }
-
-   s->osc_b -= s->osc_prev_a * step;
-   s->osc_prev_a = A;
-   s->osc_a += B * step;
-   if (s->vector_pos == 15) {
-      for (unsigned c = 0; c < 2; c++)
-         for (unsigned i = 0; i < 16; i++)
-            s->buffer[c][wrap_index(s, (int64_t)s->write - 15 + i)] = s->pending[c][i];
-      s->osc_a = q23_floor(s->osc_a);
-      s->osc_b = q23_floor(s->osc_b);
-      if (s->warmup_blocks < 128)
-         s->warmup_blocks++;
-   }
-   if (++s->write == s->size)
-      s->write = 0;
-   s->vector_pos = (s->vector_pos + 1) & 15u;
-}
-
-/* Initialise the delay and modulation before the host sends its first note.
- * This represents an already-running effect and avoids losing the first hit to
- * the original processor's short initial wet-output gate. */
-static void ready_dsp(Chorus *s) {
-   clear_dsp(s);
-   if (!s->size)
-      return;
-   const double silence[2] = {0.0, 0.0};
-   double out[2];
-   for (unsigned i = 0; i < 2048; i++)
-      process_frame(s, silence, out);
-}
-
 static clap_process_status plug_process(const clap_plugin_t *p, const clap_process_t *pr) {
    Chorus *s = p->plugin_data;
-   if (!s->size || !pr || pr->audio_inputs_count < 1 || pr->audio_outputs_count < 1 || 
+   if (!s->engine || !pr || pr->audio_inputs_count < 1 || pr->audio_outputs_count < 1 ||
        !pr->audio_inputs || !pr->audio_outputs) return CLAP_PROCESS_ERROR;
    const clap_audio_buffer_t *in = &pr->audio_inputs[0];
    clap_audio_buffer_t *out = &pr->audio_outputs[0];
-   if (in->channel_count < 2 || out->channel_count < 2 || 
+   if (in->channel_count < 2 || out->channel_count < 2 ||
        ((!in->data32 || !out->data32) && (!in->data64 || !out->data64))) return CLAP_PROCESS_ERROR;
-   const clap_input_events_t *ev = pr->in_events;
-   uint32_t n = ev && ev->size ? ev->size(ev) : 0, ix = 0;
-#if defined(__SSE2__)
-   const unsigned saved_fp_mode = _mm_getcsr();
-   _mm_setcsr(saved_fp_mode | 0x8040u);
-   /* flush-to-zero and denormals-are-zero */
-#elif defined(__aarch64__)
-   uint64_t saved_fp_mode;
-   __asm__ volatile("mrs %0, fpcr" : "=r"(saved_fp_mode));
-   uint64_t rt_fp_mode = saved_fp_mode | (1ull<<24);
-   __asm__ volatile("msr fpcr, %0" : : "r"(rt_fp_mode));
-#endif
-   for (uint32_t i = 0; i < pr->frames_count; ++i) {
-      while (ix < n) {
-         const clap_event_header_t *h = ev->get(ev, ix);
-         if (h && h->time > i) break;
-         event(s, h);
-         ++ix;
+   const clap_input_events_t *events = pr->in_events;
+   const uint32_t count = events && events->size && events->get ? events->size(events) : 0;
+   uint32_t next = 0;
+   for (uint32_t frame = 0; frame < pr->frames_count; ++frame) {
+      while (next < count) {
+         const clap_event_header_t *header = events->get(events, next);
+         if (header && header->time > frame) break;
+         event(s, header);
+         ++next;
       }
-      double x[2], y[2];
+      double input[2], output[2], controls[NPARAM];
       if (in->data32) {
-         x[0] = in->data32[0][i];
-         x[1] = in->data32[1][i];
+         input[0] = in->data32[0][frame];
+         input[1] = in->data32[1][frame];
+      } else {
+         input[0] = in->data64[0][frame];
+         input[1] = in->data64[1][frame];
       }
-      else {
-         x[0] = in->data64[0][i];
-         x[1] = in->data64[1][i];
-      }
-      process_frame(s, x, y);
+      for (unsigned i = 0; i < NPARAM; ++i) controls[i] = effective(s, i);
+      chorus_engine_process(s->engine, input, controls, output);
       if (out->data32) {
-         out->data32[0][i] = (float)y[0];
-         out->data32[1][i] = (float)y[1];
-      }
-      else {
-         out->data64[0][i] = y[0];
-         out->data64[1][i] = y[1];
+         out->data32[0][frame] = (float)output[0];
+         out->data32[1][frame] = (float)output[1];
+      } else {
+         out->data64[0][frame] = output[0];
+         out->data64[1][frame] = output[1];
       }
    }
-#if defined(__SSE2__)
-   _mm_setcsr(saved_fp_mode);
-#elif defined(__aarch64__)
-   __asm__ volatile("msr fpcr, %0" : : "r"(saved_fp_mode));
-#endif
    out->constant_mask = 0;
    return CLAP_PROCESS_CONTINUE;
 }
@@ -523,6 +300,11 @@ static uint32_t tail_get(const clap_plugin_t *p) {
    return UINT32_MAX;
 }
 static const clap_plugin_tail_t tail = {tail_get};
+static uint32_t latency_get(const clap_plugin_t *p) {
+   const Chorus *s = p->plugin_data;
+   return s->latency;
+}
+static const clap_plugin_latency_t latency = {latency_get};
 
 static const void *plug_extension(const clap_plugin_t *p, const char *id) {
    (void)p;
@@ -532,6 +314,7 @@ static const void *plug_extension(const clap_plugin_t *p, const char *id) {
    if (!strcmp(id, CLAP_EXT_STATE)) return &state;
    if (!strcmp(id, CLAP_EXT_REMOTE_CONTROLS) || !strcmp(id, CLAP_EXT_REMOTE_CONTROLS_COMPAT)) return &remote;
    if (!strcmp(id, CLAP_EXT_TAIL)) return &tail;
+   if (!strcmp(id, CLAP_EXT_LATENCY)) return &latency;
    return NULL;
 }
 static uint32_t factory_count(const clap_plugin_factory_t *f) {
